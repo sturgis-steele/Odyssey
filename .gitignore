@@ -2,6 +2,10 @@
 models/*.gguf
 models/*.GGUF
 
+# llama.cpp checkout and CLI binaries
+llama-ccp/
+llama-cli
+
 # Temporary files
 *.wav
 __pycache__/
