@@ -3,7 +3,7 @@ models/*.gguf
 models/*.GGUF
 
 # llama.cpp checkout and CLI binaries
-llama-ccp/
+llama.ccp/
 llama-cli
 
 # Temporary files
