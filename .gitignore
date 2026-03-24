@@ -1,0 +1,16 @@
+# Large model files - never commit these
+models/*.gguf
+models/*.GGUF
+
+# Temporary files
+*.wav
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environment (optional - keep if you want to track requirements)
+odyssey-env/
+
+# OS generated files
+.DS_Store
+Thumbs.db
