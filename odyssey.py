@@ -1,40 +1,37 @@
 #!/usr/bin/env python3
 """
-Computer - Vosk Version (Low CPU + High Accuracy)
-Tested for your USB Mini Mic (card 2) + LCD speakers (plughw:1,0)
+Odyssey - Vosk Version with Loud Espeak Beep
 """
 
 import os
 import time
 import ollama
-import numpy as np
 import pyaudio
 import subprocess
-from vosk import Model, KaldiRecognizer
 import json
+from vosk import Model, KaldiRecognizer
 import pyttsx3
 
-# Use your USB mic
-os.environ['ALSA_CARD'] = '2'
-
-WAKE_WORD = "computer"
+# ====================== CONFIGURATION ======================
+WAKE_WORD = "odyssey"
 LLM_MODEL = "hf.co/LiquidAI/LFM2.5-1.2B-Instruct-GGUF:latest"
+
 INPUT_DEVICE_INDEX = 2
-AUDIO_RATE = 16000          # Vosk models are 16 kHz
+AUDIO_RATE = 16000
 CHUNK = 8000
 
 SYSTEM_PROMPT = (
-    "You are Computer, a helpful, concise, and friendly voice assistant "
+    "You are Odyssey, a helpful, concise, and friendly voice assistant "
     "running locally on a Raspberry Pi 5. Speak naturally and briefly."
 )
 
-print("Initializing Computer with Vosk...")
+# ====================== INITIALIZATION ======================
+os.environ['ALSA_CARD'] = '2'
 
-# Load Vosk model
+print("Initializing Odyssey with Vosk...")
 model = Model("/home/radix/odyssey/vosk-model/model")
 recognizer = KaldiRecognizer(model, AUDIO_RATE)
 
-# TTS
 tts_engine = pyttsx3.init()
 tts_engine.setProperty("rate", 170)
 tts_engine.setProperty("volume", 1.0)
@@ -43,9 +40,18 @@ conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 p = pyaudio.PyAudio()
 
+# ====================== LOUD BEEP ======================
+def play_beep():
+    """Loud instant confirmation tone (using espeak-ng)"""
+    print("→ Beep played — speak now!")
+    subprocess.call([
+        "espeak-ng", "-a", "200", "-p", "50", "-s", "150", "beep"
+    ], stderr=subprocess.DEVNULL)
+
+# ====================== FUNCTIONS ======================
 def speak(text: str):
-    print(f"Computer: {text}")
-    temp_wav = "/tmp/computer_reply.wav"
+    print(f"Odyssey: {text}")
+    temp_wav = "/tmp/odyssey_reply.wav"
     tts_engine.save_to_file(text, temp_wav)
     tts_engine.runAndWait()
     subprocess.call(["aplay", "-D", "plughw:1,0", temp_wav], stderr=subprocess.DEVNULL)
@@ -54,11 +60,8 @@ def speak(text: str):
 
 def record_audio(duration: float = 3.0) -> bytes:
     print("Listening...")
-    stream = p.open(format=pyaudio.paInt16,
-                    channels=1,
-                    rate=AUDIO_RATE,
-                    input=True,
-                    input_device_index=INPUT_DEVICE_INDEX,
+    stream = p.open(format=pyaudio.paInt16, channels=1, rate=AUDIO_RATE,
+                    input=True, input_device_index=INPUT_DEVICE_INDEX,
                     frames_per_buffer=CHUNK)
     frames = []
     for _ in range(0, int(AUDIO_RATE / CHUNK * duration)):
@@ -83,31 +86,31 @@ def get_ollama_response(user_text: str) -> str:
     conversation_history.append({"role": "assistant", "content": reply})
     return reply
 
-print("Computer is ready and listening for 'computer'...")
-print("Speak clearly near the microphone.")
+# ====================== MAIN LOOP ======================
+print("Odyssey is ready and listening for 'odyssey'...")
+print("Say 'odyssey' → hear beep → speak immediately.")
 
 try:
     while True:
         audio_bytes = record_audio(duration=3.0)
         text = transcribe(audio_bytes).lower()
-        print(f"Transcribed: '{text}'")   # Debug line
+        print(f"Transcribed: '{text}'")
 
-        if "computer" in text:
+        if WAKE_WORD in text:
             print("→ Wake word detected!")
-            speak("Yes, I'm listening. How can I help you?")
-            
-            command_bytes = record_audio(duration=7.0)
+            play_beep()
+            command_bytes = record_audio(duration=5.0)
             command_text = transcribe(command_bytes).strip()
             print(f"You said: {command_text}")
-            
+
             if command_text and len(command_text) > 3:
                 reply = get_ollama_response(command_text)
                 speak(reply)
         
-        time.sleep(0.2)   # Low CPU now
+        time.sleep(0.2)
 
 except KeyboardInterrupt:
-    print("\nComputer shutting down.")
+    print("\nOdyssey shutting down.")
     speak("Goodbye.")
 finally:
     p.terminate()
