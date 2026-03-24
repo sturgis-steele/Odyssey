@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Full Voice Assistant – llama.cpp + Vosk (Final Stable Version)
-OpenBLAS + ALSA fixes applied
+Full Voice Assistant – llama.cpp + Vosk (Improved UX)
+Replaced spoken confirmation with a pleasant beep
 """
 
 import os
@@ -13,11 +13,10 @@ from vosk import Model, KaldiRecognizer
 import pyttsx3
 from llama_cpp import Llama
 
-# ====================== CRITICAL ENVIRONMENT FIXES (MUST BE FIRST) ======================
-# Prevent OpenBLAS threading conflicts and tell ALSA which mic to use
+# ====================== CRITICAL ENVIRONMENT FIXES ======================
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_MAIN_FREE"] = "1"
-os.environ["ALSA_CARD"] = "2"          # Your USB Mini Mic (card 2)
+os.environ["ALSA_CARD"] = "2"
 
 # ====================== CONFIGURATION ======================
 MODEL_PATH = "/home/radix/odyssey/models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
@@ -55,8 +54,10 @@ p = pyaudio.PyAudio()
 
 conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
+
 # ====================== FUNCTIONS ======================
 def speak(text: str):
+    """Speak a full response using TTS + speakers."""
     print(f"Computer: {text}")
     temp_wav = "/tmp/computer_reply.wav"
     tts_engine.save_to_file(text, temp_wav)
@@ -65,30 +66,37 @@ def speak(text: str):
     if os.path.exists(temp_wav):
         os.remove(temp_wav)
 
-def record_audio(duration: float = 3.0) -> bytes:
-    """Record audio with error handling to prevent silent segfaults."""
-    print("Listening...")
-    try:
-        stream = p.open(format=pyaudio.paInt16,
-                        channels=1,
-                        rate=AUDIO_RATE,
-                        input=True,
-                        input_device_index=INPUT_DEVICE_INDEX,
-                        frames_per_buffer=CHUNK)
-    except Exception as e:
-        print(f"ERROR opening microphone: {e}")
-        raise
 
+def beep():
+    """Play a short, pleasant confirmation beep (no TTS delay)."""
+    print("→ Wake word detected! (beep)")
+    # 432 Hz sine wave for ~0.8 seconds — clean and professional
+    subprocess.call([
+        "speaker-test", "-t", "sine", "-f", "432",
+        "-l", "1", "-D", "plughw:1,0"
+    ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+
+
+def record_audio(duration: float = 3.0) -> bytes:
+    """Record audio from the USB microphone."""
+    print("Listening...")
+    stream = p.open(format=pyaudio.paInt16,
+                    channels=1,
+                    rate=AUDIO_RATE,
+                    input=True,
+                    input_device_index=INPUT_DEVICE_INDEX,
+                    frames_per_buffer=CHUNK)
     frames = []
     for _ in range(0, int(AUDIO_RATE / CHUNK * duration)):
         data = stream.read(CHUNK, exception_on_overflow=False)
         frames.append(data)
-    
     stream.stop_stream()
     stream.close()
     return b''.join(frames)
 
+
 def transcribe(audio_bytes: bytes) -> str:
+    """Convert audio to text using Vosk."""
     if recognizer.AcceptWaveform(audio_bytes):
         result = json.loads(recognizer.Result())
         return result.get("text", "").strip()
@@ -96,7 +104,9 @@ def transcribe(audio_bytes: bytes) -> str:
         result = json.loads(recognizer.PartialResult())
         return result.get("partial", "").strip()
 
+
 def get_llama_response(user_text: str) -> str:
+    """Get response from the LLM."""
     conversation_history.append({"role": "user", "content": user_text})
     response = llm.create_chat_completion(
         messages=conversation_history,
@@ -106,6 +116,7 @@ def get_llama_response(user_text: str) -> str:
     reply = response["choices"][0]["message"]["content"].strip()
     conversation_history.append({"role": "assistant", "content": reply})
     return reply
+
 
 # ====================== MAIN LOOP ======================
 print("\nComputer is now listening for the wake word 'computer'...")
@@ -118,17 +129,17 @@ try:
         print(f"Transcribed: '{text}'")
 
         if WAKE_WORD in text:
-            print("→ Wake word detected!")
-            speak("Yes, I'm listening. How can I help you?")
-            
+            beep()                                      # <-- Nice beep instead of spoken phrase
+
+            # Immediately start recording the command
             command_bytes = record_audio(duration=7.0)
             command_text = transcribe(command_bytes).strip()
             print(f"You said: {command_text}")
-            
+
             if command_text and len(command_text) > 3:
                 reply = get_llama_response(command_text)
-                speak(reply)
-        
+                speak(reply)                            # Full response is still spoken
+
         time.sleep(0.2)
 
 except KeyboardInterrupt:
