@@ -68,14 +68,24 @@ def speak(text: str):
 
 
 def beep():
-    """Play a short, pleasant confirmation beep (no TTS delay)."""
+    """Play a short, pleasant confirmation beep with fade in/out (~0.5 seconds)."""
     print("→ Wake word detected! (beep)")
-    # 432 Hz sine wave for ~0.8 seconds — clean and professional
+    temp_beep = "/tmp/wake_beep.wav"
+    
+    # Generate a clean 880 Hz tone (0.5 seconds total) with fade-in and fade-out
     subprocess.call([
-        "speaker-test", "-t", "sine", "-f", "432",
-        "-l", "1", "-D", "plughw:1,0"
+        "sox", "-n", temp_beep,
+        "synth", "0.9", "sine", "369",     # duration, waveform, frequency
+        "fade", "q", "0.12", "0.6", "0.12" # fade type, fade-in, duration, fade-out
     ], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-
+    
+    # Play it on your speakers
+    subprocess.call(["aplay", "-D", "plughw:1,0", temp_beep], 
+                    stderr=subprocess.DEVNULL)
+    
+    # Clean up temporary file
+    if os.path.exists(temp_beep):
+        os.remove(temp_beep)
 
 def record_audio(duration: float = 3.0) -> bytes:
     """Record audio from the USB microphone."""
@@ -144,7 +154,7 @@ try:
 
 except KeyboardInterrupt:
     print("\nShutting down Computer...")
-    speak("Goodbye.")
+    speak(" Goodbye.")
 
 finally:
     p.terminate()
