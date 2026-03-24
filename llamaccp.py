@@ -1,146 +1,140 @@
 #!/usr/bin/env python3
 """
-Bare-Bones Llama.cpp Voice Assistant Test Script
-Fully commented for learning and maintenance.
-Project location: ~/odyssey/llama-ccp/computer_llama.py
+Full Voice Assistant – llama.cpp + Vosk (Final Stable Version)
+OpenBLAS + ALSA fixes applied
 """
 
-import os                  # Used to work with files and folders (e.g., deleting temp audio file)
-import time                # Used for small delays to reduce CPU usage
-import subprocess          # Used to call the "aplay" command to play sound through your speakers
-import pyttsx3             # Text-to-Speech engine (converts text into spoken audio)
-from llama_cpp import Llama  # The main library that gives us access to llama.cpp (fast local LLM inference)
+import os
+import time
+import subprocess
+import json
+import pyaudio
+from vosk import Model, KaldiRecognizer
+import pyttsx3
+from llama_cpp import Llama
 
+# ====================== CRITICAL ENVIRONMENT FIXES (MUST BE FIRST) ======================
+# Prevent OpenBLAS threading conflicts and tell ALSA which mic to use
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_MAIN_FREE"] = "1"
+os.environ["ALSA_CARD"] = "2"          # Your USB Mini Mic (card 2)
 
 # ====================== CONFIGURATION ======================
-# This section contains settings you can easily change
-
-# Path to the GGUF model file we downloaded
-# Make sure this path exactly matches your filename in ~/odyssey/models/
 MODEL_PATH = "/home/radix/odyssey/models/LFM2.5-1.2B-Instruct-Q4_K_M.gguf"
 
-# System prompt tells the model how to behave
+WAKE_WORD = "computer"
+INPUT_DEVICE_INDEX = 2
+AUDIO_RATE = 16000
+CHUNK = 8000
+
 SYSTEM_PROMPT = (
     "You are Computer, a helpful, concise, and friendly voice assistant "
     "running locally on a Raspberry Pi 5. Speak naturally and briefly."
 )
 
-# Wake word (kept for future voice integration)
-WAKE_WORD = "computer"
-
-
 # ====================== INITIALIZATION ======================
-# Everything in this section runs once when the script starts
+print("Initializing Computer with llama.cpp + Vosk...")
 
-print("Initializing Computer with llama.cpp...")
-
-# Load the LLM model using llama.cpp
-# This is the most important part — it loads the quantized model into RAM
 llm = Llama(
-    model_path=MODEL_PATH,      # Path to the .gguf file
-    n_ctx=4096,                 # Maximum context length (how much conversation history the model can remember)
-    n_threads=4,                # Number of CPU threads — set to 4 because Raspberry Pi 5 has 4 performance cores
-    n_batch=512,                # How many tokens to process at once (good balance for speed on Pi)
-    verbose=False,              # Set to True if you want detailed debug information during inference
+    model_path=MODEL_PATH,
+    n_ctx=2048,
+    n_threads=3,
+    n_batch=256,
+    verbose=False,
 )
 
-# Initialize the Text-to-Speech engine (pyttsx3)
 tts_engine = pyttsx3.init()
+tts_engine.setProperty("rate", 170)
+tts_engine.setProperty("volume", 1.0)
 
-# Configure voice settings
-tts_engine.setProperty("rate", 170)    # Speaking speed (170 words per minute is natural)
-tts_engine.setProperty("volume", 1.0)  # Full volume
+print("Loading Vosk model...")
+vosk_model = Model("/home/radix/odyssey/vosk-model/model")
+recognizer = KaldiRecognizer(vosk_model, AUDIO_RATE)
 
-# Start conversation history with the system prompt
-# This tells the model who it is from the very beginning
+p = pyaudio.PyAudio()
+
 conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-
 # ====================== FUNCTIONS ======================
-# Reusable functions that perform specific tasks
-
 def speak(text: str):
-    """
-    Converts text to speech and plays it through your USB speakers (plughw:1,0).
-    This is the same speak() function from your original script.
-    """
-    print(f"Computer: {text}")                     # Print the response to the terminal
-
-    temp_wav = "/tmp/computer_reply.wav"           # Temporary file to store generated audio
-
-    # Generate speech and save it as a WAV file
+    print(f"Computer: {text}")
+    temp_wav = "/tmp/computer_reply.wav"
     tts_engine.save_to_file(text, temp_wav)
-    tts_engine.runAndWait()                        # Actually generate the audio
-
-    # Play the audio file using aplay (your speaker setup)
-    subprocess.call(["aplay", "-D", "plughw:1,0", temp_wav], 
-                    stderr=subprocess.DEVNULL)     # Hide any error messages
-
-    # Clean up — delete the temporary WAV file
+    tts_engine.runAndWait()
+    subprocess.call(["aplay", "-D", "plughw:1,0", temp_wav], stderr=subprocess.DEVNULL)
     if os.path.exists(temp_wav):
         os.remove(temp_wav)
 
+def record_audio(duration: float = 3.0) -> bytes:
+    """Record audio with error handling to prevent silent segfaults."""
+    print("Listening...")
+    try:
+        stream = p.open(format=pyaudio.paInt16,
+                        channels=1,
+                        rate=AUDIO_RATE,
+                        input=True,
+                        input_device_index=INPUT_DEVICE_INDEX,
+                        frames_per_buffer=CHUNK)
+    except Exception as e:
+        print(f"ERROR opening microphone: {e}")
+        raise
+
+    frames = []
+    for _ in range(0, int(AUDIO_RATE / CHUNK * duration)):
+        data = stream.read(CHUNK, exception_on_overflow=False)
+        frames.append(data)
+    
+    stream.stop_stream()
+    stream.close()
+    return b''.join(frames)
+
+def transcribe(audio_bytes: bytes) -> str:
+    if recognizer.AcceptWaveform(audio_bytes):
+        result = json.loads(recognizer.Result())
+        return result.get("text", "").strip()
+    else:
+        result = json.loads(recognizer.PartialResult())
+        return result.get("partial", "").strip()
 
 def get_llama_response(user_text: str) -> str:
-    """
-    Sends the user's message to the LLM and returns the assistant's reply.
-    Uses the same chat format as your original Ollama code.
-    """
-    # Add the user's message to the conversation history
     conversation_history.append({"role": "user", "content": user_text})
-    
-    # Call the model to generate a response
     response = llm.create_chat_completion(
-        messages=conversation_history,   # Send full conversation so far
-        temperature=0.7,                 # Controls creativity (0.7 is balanced)
-        max_tokens=512,                  # Maximum length of the reply
+        messages=conversation_history,
+        temperature=0.7,
+        max_tokens=512,
     )
-    
-    # Extract the text reply from the model's response
     reply = response["choices"][0]["message"]["content"].strip()
-    
-    # Add the assistant's reply to the conversation history
     conversation_history.append({"role": "assistant", "content": reply})
-    
     return reply
 
-
 # ====================== MAIN LOOP ======================
-# This is where the program runs continuously
-
-print("\nComputer is ready for testing.")
-print("Type your message and press Enter. Type 'exit' to quit.\n")
+print("\nComputer is now listening for the wake word 'computer'...")
+print("Speak clearly near the USB microphone.\n")
 
 try:
-    while True:                                # Keep running until user exits
-        # Get input from the keyboard
-        user_input = input("You: ").strip()
-        
-        # Allow graceful exit
-        if user_input.lower() == "exit":
-            break
-        
-        # Skip empty messages
-        if not user_input:
-            continue
+    while True:
+        audio_bytes = record_audio(duration=3.0)
+        text = transcribe(audio_bytes).lower()
+        print(f"Transcribed: '{text}'")
 
-        # Optional: detect wake word (useful when we add voice later)
-        if WAKE_WORD in user_input.lower():
+        if WAKE_WORD in text:
             print("→ Wake word detected!")
             speak("Yes, I'm listening. How can I help you?")
-            user_input = input("You (command): ").strip()
-
-        # Only process meaningful input
-        if user_input and len(user_input) > 3:
-            reply = get_llama_response(user_input)   # Get AI response
-            speak(reply)                             # Speak the response
-
-        time.sleep(0.2)      # Small delay to keep CPU usage low
+            
+            command_bytes = record_audio(duration=7.0)
+            command_text = transcribe(command_bytes).strip()
+            print(f"You said: {command_text}")
+            
+            if command_text and len(command_text) > 3:
+                reply = get_llama_response(command_text)
+                speak(reply)
+        
+        time.sleep(0.2)
 
 except KeyboardInterrupt:
-    # This runs if you press Ctrl+C
-    print("\nShutting down...")
+    print("\nShutting down Computer...")
     speak("Goodbye.")
 
 finally:
+    p.terminate()
     print("Session ended.")
