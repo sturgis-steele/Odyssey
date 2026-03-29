@@ -27,10 +27,9 @@ INPUT_DEVICE_INDEX = 2
 AUDIO_RATE = 16000
 CHUNK = 8000
 
-# Silence detection settings (tune these if needed)
-ENERGY_THRESHOLD = 300      # Lower = more sensitive to quiet speech (try 200–500)
-SILENCE_SECONDS = 1.2       # How long of silence before we stop recording
-MAX_COMMAND_SECONDS = 60    # Safety timeout
+# ====================== SILENCE DETECTION (WORD-BASED) ======================
+WORD_SILENCE_SECONDS = 1.2      # How long the partial text must remain unchanged before stopping
+MAX_COMMAND_SECONDS   = 20      # Safety timeout (reduced from 60)
 
 SYSTEM_PROMPT = (
     "You are Odyssey, a calm, precise, and intelligent voice assistant "
@@ -126,40 +125,50 @@ def get_rms(audio_chunk: bytes) -> float:
     return math.sqrt(rms / count) if count > 0 else 0.0
 
 def record_command_until_silence() -> str:
-    """Record until the user stops speaking (simple energy-based silence detection)."""
-    print("Listening for your command... (speak naturally — I will stop when you finish)")
+    """Record until the user finishes speaking, using Vosk partial results (word-based detection)."""
+    print("Listening for your command... (I will stop automatically when you finish speaking)")
 
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=AUDIO_RATE,
                     input=True, input_device_index=INPUT_DEVICE_INDEX,
                     frames_per_buffer=CHUNK)
 
     frames = []
-    silence_frames = 0
+    last_text = ""
+    silence_start = time.time()
     max_frames = int(AUDIO_RATE / CHUNK * MAX_COMMAND_SECONDS)
-    silence_threshold_frames = int(AUDIO_RATE / CHUNK * SILENCE_SECONDS)
 
     while len(frames) < max_frames:
         data = stream.read(CHUNK, exception_on_overflow=False)
         frames.append(data)
 
-        rms = get_rms(data)
-        if rms < ENERGY_THRESHOLD:
-            silence_frames += 1
+        # Feed chunk to Vosk for continuous recognition
+        if recognizer.AcceptWaveform(data):
+            result = json.loads(recognizer.Result())
+            current_text = result.get("text", "").strip()
         else:
-            silence_frames = 0
+            partial = json.loads(recognizer.PartialResult())
+            current_text = partial.get("partial", "").strip()
 
-        if silence_frames >= silence_threshold_frames:
-            print("Silence detected — stopping recording")
+        # Log partial text for debugging (optional – remove later if desired)
+        if current_text != last_text:
+            print(f"Partial: '{current_text}'")
+            last_text = current_text
+            silence_start = time.time()  # Reset silence timer when new words appear
+
+        # Word-based silence detection: stop if text has not changed for WORD_SILENCE_SECONDS
+        if time.time() - silence_start >= WORD_SILENCE_SECONDS and last_text:
+            print("End of speech detected (no new words) — stopping recording")
             break
 
     stream.stop_stream()
     stream.close()
 
+    # Final transcription
     audio_bytes = b''.join(frames)
-    command_text = transcribe(audio_bytes)
+    command_text = transcribe(audio_bytes)  # Uses full Result()
     print(f"You said: {command_text}")
     return command_text
-
+    
 def get_llama_response(user_text: str) -> str:
     conversation_history.append({"role": "user", "content": user_text})
     response = llm.create_chat_completion(
