@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 """
-Full Voice Assistant – llama.cpp + Vosk + Word-Based Silence Detection
-With comprehensive logging for full visibility into every step.
+Full Voice Assistant – llama.cpp + Vosk + Continuous Streaming Listener
+Single persistent audio stream for instant wake-word + command detection.
 """
 
 import os
 import time
 import subprocess
 import json
-import math
 import pyaudio
 from vosk import Model, KaldiRecognizer
 import pyttsx3
 from llama_cpp import Llama
 import logging
 
-# ====================== LOGGING SETUP (comprehensive) ======================
+# ====================== LOGGING SETUP ======================
 logging.basicConfig(
-    level=logging.DEBUG,  # Change to logging.INFO when you want less detail
+    level=logging.DEBUG,  # Change to logging.INFO for normal use
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
-logger.info("Odyssey script starting – comprehensive logging enabled")
+logger.info("Odyssey script starting – continuous streaming listener enabled")
 
 # ====================== CRITICAL ENVIRONMENT FIXES ======================
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -39,9 +38,9 @@ INPUT_DEVICE_INDEX = 2
 AUDIO_RATE = 16000
 CHUNK = 8000
 
-# Word-based silence detection (new, more reliable)
-WORD_SILENCE_SECONDS = 1.2      # Seconds of unchanged partial text before stopping
-MAX_COMMAND_SECONDS   = 20      # Safety timeout
+# Word-based silence detection
+WORD_SILENCE_SECONDS = 1.2
+MAX_COMMAND_SECONDS = 20
 
 SYSTEM_PROMPT = (
     "You are Odyssey, a calm, precise, and intelligent voice assistant "
@@ -65,7 +64,7 @@ SYSTEM_PROMPT = (
 logger.info("Configuration loaded – wake word: '%s', max command time: %d s", WAKE_WORD, MAX_COMMAND_SECONDS)
 
 # ====================== INITIALIZATION ======================
-logger.info("Initializing Odyssey with llama.cpp + Vosk + word-based silence detection...")
+logger.info("Initializing Odyssey with continuous streaming listener...")
 
 llm = Llama(
     model_path=MODEL_PATH,
@@ -114,20 +113,6 @@ def beep():
         os.remove(temp_beep)
     logger.debug("Wake beep completed")
 
-def record_audio(duration: float = 3.0) -> bytes:
-    logger.debug("Recording fixed-duration audio for wake-word detection (%.1f s)", duration)
-    stream = p.open(format=pyaudio.paInt16, channels=1, rate=AUDIO_RATE,
-                    input=True, input_device_index=INPUT_DEVICE_INDEX,
-                    frames_per_buffer=CHUNK)
-    frames = []
-    for i in range(0, int(AUDIO_RATE / CHUNK * duration)):
-        data = stream.read(CHUNK, exception_on_overflow=False)
-        frames.append(data)
-    stream.stop_stream()
-    stream.close()
-    logger.debug("Fixed-duration recording finished – %d frames captured", len(frames))
-    return b''.join(frames)
-
 def transcribe(audio_bytes: bytes) -> str:
     logger.debug("Transcribing full audio buffer (%d bytes)", len(audio_bytes))
     if recognizer.AcceptWaveform(audio_bytes):
@@ -138,54 +123,6 @@ def transcribe(audio_bytes: bytes) -> str:
         text = result.get("partial", "").strip()
     logger.info("Transcription result: '%s'", text)
     return text
-
-def record_command_until_silence() -> str:
-    """Record until the user finishes speaking, using stable partial results (robust against Vosk clearing)."""
-    logger.info("Starting robust word-based command recording")
-    stream = p.open(format=pyaudio.paInt16, channels=1, rate=AUDIO_RATE,
-                    input=True, input_device_index=INPUT_DEVICE_INDEX,
-                    frames_per_buffer=CHUNK)
-
-    frames = []
-    stable_text = ""
-    last_change_time = time.time()
-    max_frames = int(AUDIO_RATE / CHUNK * MAX_COMMAND_SECONDS)
-    chunk_count = 0
-
-    while len(frames) < max_frames:
-        data = stream.read(CHUNK, exception_on_overflow=False)
-        frames.append(data)
-        chunk_count += 1
-
-        # Feed to Vosk
-        if recognizer.AcceptWaveform(data):
-            result = json.loads(recognizer.Result())
-            current_text = result.get("text", "").strip()
-        else:
-            partial = json.loads(recognizer.PartialResult())
-            current_text = partial.get("partial", "").strip()
-
-        # Only update stable_text if it has grown (more characters)
-        if len(current_text) > len(stable_text):
-            logger.debug("Partial improved: '%s' → '%s' (chunk %d)", stable_text, current_text, chunk_count)
-            stable_text = current_text
-            last_change_time = time.time()
-
-        # Silence detection based on stable text
-        elapsed = time.time() - last_change_time
-        if stable_text and elapsed >= WORD_SILENCE_SECONDS:
-            logger.info("End of speech detected (stable text unchanged for %.1f s) – stopping recording", elapsed)
-            break
-
-    stream.stop_stream()
-    stream.close()
-    logger.debug("Command recording stopped after %d chunks", chunk_count)
-
-    # Final transcription of full buffer
-    audio_bytes = b''.join(frames)
-    command_text = transcribe(audio_bytes)
-    logger.info("Final command transcribed: '%s'", command_text)
-    return command_text
 
 def get_llama_response(user_text: str) -> str:
     logger.info("Sending command to LLM: '%s'", user_text)
@@ -204,32 +141,102 @@ def get_llama_response(user_text: str) -> str:
     logger.info("LLM response generated in %.2f s: '%s'", elapsed, reply)
     return reply
 
-# ====================== MAIN LOOP ======================
-logger.info("Odyssey is now listening for the wake word '%s'...", WAKE_WORD)
+# ====================== MAIN CONTINUOUS STREAMING LOOP ======================
+logger.info("Odyssey is now listening continuously for the wake word '%s'...", WAKE_WORD)
 
 try:
+    # Open ONE persistent audio stream that remains open for the entire session
+    stream = p.open(format=pyaudio.paInt16,
+                    channels=1,
+                    rate=AUDIO_RATE,
+                    input=True,
+                    input_device_index=INPUT_DEVICE_INDEX,
+                    frames_per_buffer=CHUNK)
+
+    # Outer loop ensures the assistant never terminates after a single interaction
     while True:
-        logger.debug("Starting wake-word listening cycle")
-        audio_bytes = record_audio(duration=3.0)
-        text = transcribe(audio_bytes).lower()
-        logger.debug("Wake-word cycle transcription: '%s'", text)
+        state = "wake"                    # reset to wake mode for each new cycle
+        frames = []                       # only used in command mode
+        stable_text = ""
+        last_change_time = time.time()
+        command_start_time = time.time()
+        chunk_count = 0
 
-        if WAKE_WORD in text:
-            beep()
-            command_text = record_command_until_silence()
+        # Inner loop: read audio chunks continuously
+        while True:
+            data = stream.read(CHUNK, exception_on_overflow=False)
+            chunk_count += 1
 
-            if command_text and len(command_text) > 3:
+            # Feed chunk to Vosk
+            if recognizer.AcceptWaveform(data):
+                result = json.loads(recognizer.Result())
+                current_text = result.get("text", "").strip()
+            else:
+                partial = json.loads(recognizer.PartialResult())
+                current_text = partial.get("partial", "").strip()
+
+            lower_text = current_text.lower()
+
+            # --------------------- WAKE MODE ---------------------
+            if state == "wake":
+                if WAKE_WORD in lower_text:
+                    beep()
+                    logger.info("Switching to command mode")
+                    state = "command"
+                    frames = [data]
+                    stable_text = ""
+                    last_change_time = time.time()
+                    command_start_time = time.time()
+                    if lower_text.startswith(WAKE_WORD):
+                        current_text = current_text[len(WAKE_WORD):].strip()
+
+            # --------------------- COMMAND MODE ---------------------
+            elif state == "command":
+                frames.append(data)
+
+                # Update stable_text only when it grows
+                if len(current_text) > len(stable_text):
+                    logger.debug("Partial improved: '%s' → '%s' (chunk %d)", stable_text, current_text, chunk_count)
+                    stable_text = current_text
+                    last_change_time = time.time()
+
+                # Silence detection
+                elapsed = time.time() - last_change_time
+                if stable_text and elapsed >= WORD_SILENCE_SECONDS:
+                    logger.info("End of speech detected (stable text unchanged for %.1f s)", elapsed)
+                    break
+
+                # Safety timeout
+                if time.time() - command_start_time > MAX_COMMAND_SECONDS:
+                    logger.warning("Command recording reached safety timeout")
+                    break
+
+        # --------------------- PROCESS COMMAND (after silence) ---------------------
+        if stable_text and len(stable_text) > 3:
+            audio_bytes = b''.join(frames)
+            command_text = transcribe(audio_bytes)
+            command_text = command_text.replace(WAKE_WORD, "").strip()
+            
+            if command_text:
                 reply = get_llama_response(command_text)
                 speak(reply)
             else:
-                logger.warning("Command too short or empty – skipping LLM call")
+                logger.warning("Command too short after processing – skipping LLM")
+        else:
+            logger.warning("No valid command detected")
 
-        time.sleep(0.2)
+        logger.info("Returned to continuous wake-word listening")
+        # Loop automatically returns to the outer while True → new wake cycle
 
 except KeyboardInterrupt:
     logger.info("Keyboard interrupt received – shutting down Odyssey gracefully")
     speak("Goodbye.")
 
 finally:
+    try:
+        stream.stop_stream()
+        stream.close()
+    except:
+        pass
     p.terminate()
     logger.info("PyAudio terminated – session ended cleanly")
