@@ -32,6 +32,7 @@ openwakeword==0.4.0
 packaging==26.0
 piper-tts==1.4.1
 protobuf==7.34.0
+psutil==7.2.2
 PyAudio==0.2.14
 pycparser==3.0
 pydantic==2.12.5
