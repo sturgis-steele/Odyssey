@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Full Voice Assistant – llama.cpp + Vosk + Continuous Streaming Listener
-Single persistent audio stream for instant wake-word + command detection.
+Full Voice Assistant – llama.cpp + Vosk + Continuous Streaming Listener + Tool Calling
 """
 
 import os
@@ -13,16 +12,17 @@ from vosk import Model, KaldiRecognizer
 import pyttsx3
 from llama_cpp import Llama
 import logging
+import re
 
 # ====================== LOGGING SETUP ======================
 logging.basicConfig(
-    level=logging.DEBUG,  # Change to logging.INFO for normal use
+    level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
-logger.info("Odyssey script starting – continuous streaming listener enabled")
+logger.info("Odyssey script starting – continuous streaming listener with tool calling enabled")
 
 # ====================== CRITICAL ENVIRONMENT FIXES ======================
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -38,7 +38,6 @@ INPUT_DEVICE_INDEX = 2
 AUDIO_RATE = 16000
 CHUNK = 8000
 
-# Word-based silence detection
 WORD_SILENCE_SECONDS = 1.2
 MAX_COMMAND_SECONDS = 20
 
@@ -48,23 +47,27 @@ SYSTEM_PROMPT = (
     "You are the central AI of the private local AI system named Odyssey. "
     "Your sole purpose is to be a helpful personal assistant to your human user, "
     "acting like a modern Jarvis. "
+    "You have access to tools and you MUST use them. You are NOT allowed to answer from your own knowledge.\n\n"
+    "Exact rules:\n"
+    "- If the user asks about time, date, sunrise, or sunset → respond with EXACTLY [get_time_and_date()] and nothing else\n"
+    "- If the user asks about system status, CPU, RAM, temperature, disk, or uptime → respond with EXACTLY [get_system_status()] and nothing else\n"
+    "- If the user asks about power, battery, or runtime → respond with EXACTLY [get_power_summary()] and nothing else\n"
+    "- If the user asks for a daily briefing or summary → respond with EXACTLY [get_daily_briefing()] and nothing else\n\n"
+    "Few-shot examples:\n"
+    "User: what time is it → [get_time_and_date()]\n"
+    "User: what is the system status → [get_system_status()]\n"
+    "User: give me the daily briefing → [get_daily_briefing()]\n"
+    "Never add extra text, greetings, or explanations when calling a tool. "
     "You must always be completely honest about your current capabilities. "
-    "Never volunteer any information about what you can or cannot do. "
-    "Never mention your capabilities, limitations, tools, or future features "
-    "unless the user directly asks 'what are you' or 'what can you do'. "
     "Speak only in clear, natural, machine-like sentences. "
     "Be extremely concise and keep every response short and to the point. "
-    "If the user mentions future features or tools, simply acknowledge them "
-    "briefly and say you will be able to use them once they are implemented. "
-    "Maintain a calm, professional, and robotic demeanor at all times. "
-    "Never use slang, emojis, or casual language. "
-    "Never use lists, bullets, or structured formats."
+    "Maintain a calm, professional, and robotic demeanor at all times."
 )
 
-logger.info("Configuration loaded – wake word: '%s', max command time: %d s", WAKE_WORD, MAX_COMMAND_SECONDS)
+logger.info("Configuration loaded – wake word: '%s'", WAKE_WORD)
 
 # ====================== INITIALIZATION ======================
-logger.info("Initializing Odyssey with continuous streaming listener...")
+logger.info("Initializing Odyssey with tool-calling support...")
 
 llm = Llama(
     model_path=MODEL_PATH,
@@ -73,7 +76,7 @@ llm = Llama(
     n_batch=256,
     verbose=False,
 )
-logger.info("LLM model loaded successfully (LFM2-1.2B-Tool-Q8_0)")
+logger.info("LLM model loaded successfully")
 
 tts_engine = pyttsx3.init()
 tts_engine.setProperty("rate", 170)
@@ -88,6 +91,10 @@ logger.info("Vosk model and recognizer ready")
 p = pyaudio.PyAudio()
 logger.debug("PyAudio stream manager initialized")
 
+# Import tools (this registers them automatically)
+import tools  # noqa: F401
+from tools.registry import get_tool_schemas, get_tool_function
+
 conversation_history = [{"role": "system", "content": SYSTEM_PROMPT}]
 logger.info("System prompt loaded – conversation history initialized")
 
@@ -95,13 +102,24 @@ logger.info("System prompt loaded – conversation history initialized")
 def speak(text: str):
     logger.info("Odyssey speaking: %s", text)
     temp_wav = "/tmp/odyssey_reply.wav"
-    tts_engine.save_to_file(text, temp_wav)
-    tts_engine.runAndWait()
-    logger.debug("TTS audio file generated")
-    subprocess.call(["aplay", "-D", "plughw:1,0", temp_wav], stderr=subprocess.DEVNULL)
-    if os.path.exists(temp_wav):
-        os.remove(temp_wav)
-    logger.debug("TTS playback completed and temporary file cleaned")
+    try:
+        tts_engine.save_to_file(text, temp_wav)
+        tts_engine.runAndWait()
+        time.sleep(0.25)  # ensure file is fully written and ALSA device is free
+        logger.debug("TTS audio file generated")
+        
+        result = subprocess.call(
+            ["aplay", "-D", "plughw:1,0", temp_wav],
+            stderr=subprocess.DEVNULL
+        )
+        if result != 0:
+            logger.warning("aplay returned non-zero exit code")
+    except Exception as e:
+        logger.error("TTS playback error: %s", e)
+    finally:
+        if os.path.exists(temp_wav):
+            os.remove(temp_wav)
+    logger.debug("TTS playback completed")
 
 def beep():
     logger.info("→ Wake word detected! Playing beep")
@@ -125,17 +143,47 @@ def transcribe(audio_bytes: bytes) -> str:
     return text
 
 def get_llama_response(user_text: str) -> str:
-    logger.info("Sending command to LLM: '%s'", user_text)
+    logger.info("Sending command to LLM with tools: '%s'", user_text)
     start_time = time.time()
+
     conversation_history.append({"role": "user", "content": user_text})
-    
+
     response = llm.create_chat_completion(
         messages=conversation_history,
+        tools=get_tool_schemas(),
+        tool_choice="auto",
         temperature=0.7,
         max_tokens=512,
     )
-    reply = response["choices"][0]["message"]["content"].strip()
-    
+
+    message = response["choices"][0]["message"]
+    reply = message.get("content", "").strip()
+
+    # Robust tool-tag detection (handles [tool()], <|tool|>, or just the name)
+    import re
+    tool_name = None
+    match = re.search(r'\[(\w+)(?:\s*\(\))?\]', reply) or re.search(r'<\|(\w+)\|>', reply)
+    if match:
+        tool_name = match.group(1)
+    elif any(name in reply.lower() for name in ["get_time_and_date", "get_system_status", "get_power_summary", "get_daily_briefing"]):
+        # Fallback: model mentioned the name without brackets
+        for name in ["get_time_and_date", "get_system_status", "get_power_summary", "get_daily_briefing"]:
+            if name in reply.lower():
+                tool_name = name
+                break
+
+    if tool_name:
+        logger.info("Detected tool tag from model: %s", tool_name)
+        func = get_tool_function(tool_name)
+        if func:
+            try:
+                result = func()
+                reply = result
+            except Exception as e:
+                reply = f"Tool error: {str(e)}"
+        else:
+            reply = f"Unknown tool requested: {tool_name}"
+
     conversation_history.append({"role": "assistant", "content": reply})
     elapsed = time.time() - start_time
     logger.info("LLM response generated in %.2f s: '%s'", elapsed, reply)
@@ -145,7 +193,6 @@ def get_llama_response(user_text: str) -> str:
 logger.info("Odyssey is now listening continuously for the wake word '%s'...", WAKE_WORD)
 
 try:
-    # Open ONE persistent audio stream that remains open for the entire session
     stream = p.open(format=pyaudio.paInt16,
                     channels=1,
                     rate=AUDIO_RATE,
@@ -153,21 +200,18 @@ try:
                     input_device_index=INPUT_DEVICE_INDEX,
                     frames_per_buffer=CHUNK)
 
-    # Outer loop ensures the assistant never terminates after a single interaction
     while True:
-        state = "wake"                    # reset to wake mode for each new cycle
-        frames = []                       # only used in command mode
+        state = "wake"
+        frames = []
         stable_text = ""
         last_change_time = time.time()
         command_start_time = time.time()
         chunk_count = 0
 
-        # Inner loop: read audio chunks continuously
         while True:
             data = stream.read(CHUNK, exception_on_overflow=False)
             chunk_count += 1
 
-            # Feed chunk to Vosk
             if recognizer.AcceptWaveform(data):
                 result = json.loads(recognizer.Result())
                 current_text = result.get("text", "").strip()
@@ -177,7 +221,6 @@ try:
 
             lower_text = current_text.lower()
 
-            # --------------------- WAKE MODE ---------------------
             if state == "wake":
                 if WAKE_WORD in lower_text:
                     beep()
@@ -190,33 +233,28 @@ try:
                     if lower_text.startswith(WAKE_WORD):
                         current_text = current_text[len(WAKE_WORD):].strip()
 
-            # --------------------- COMMAND MODE ---------------------
             elif state == "command":
                 frames.append(data)
 
-                # Update stable_text only when it grows
                 if len(current_text) > len(stable_text):
                     logger.debug("Partial improved: '%s' → '%s' (chunk %d)", stable_text, current_text, chunk_count)
                     stable_text = current_text
                     last_change_time = time.time()
 
-                # Silence detection
                 elapsed = time.time() - last_change_time
                 if stable_text and elapsed >= WORD_SILENCE_SECONDS:
-                    logger.info("End of speech detected (stable text unchanged for %.1f s)", elapsed)
+                    logger.info("End of speech detected")
                     break
 
-                # Safety timeout
                 if time.time() - command_start_time > MAX_COMMAND_SECONDS:
                     logger.warning("Command recording reached safety timeout")
                     break
 
-        # --------------------- PROCESS COMMAND (after silence) ---------------------
         if stable_text and len(stable_text) > 3:
             audio_bytes = b''.join(frames)
             command_text = transcribe(audio_bytes)
             command_text = command_text.replace(WAKE_WORD, "").strip()
-            
+
             if command_text:
                 reply = get_llama_response(command_text)
                 speak(reply)
@@ -226,7 +264,6 @@ try:
             logger.warning("No valid command detected")
 
         logger.info("Returned to continuous wake-word listening")
-        # Loop automatically returns to the outer while True → new wake cycle
 
 except KeyboardInterrupt:
     logger.info("Keyboard interrupt received – shutting down Odyssey gracefully")
